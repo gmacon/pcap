@@ -682,6 +682,9 @@ unsafe impl State for Dead {}
 pub struct Capture<T: State + ?Sized> {
     nonblock: bool,
     handle: Unique<raw::pcap_t>,
+    header: *mut raw::pcap_pkthdr,
+    packet: *const libc::c_uchar,
+    retcode: i32,
     _marker: PhantomData<T>,
 }
 
@@ -690,6 +693,9 @@ impl<T: State + ?Sized> Capture<T> {
         Capture {
             nonblock: false,
             handle: Unique::new(handle),
+            header: ptr::null_mut(),
+            packet: ptr::null(),
+            retcode: -2,
             _marker: PhantomData,
         }
     }
@@ -1039,6 +1045,48 @@ impl<T: Activated + ?Sized> Capture<T> {
         self.check_err(unsafe { raw::pcap_setdirection(*self.handle, direction as u32 as _) == 0 })
     }
 
+    fn advance_packet(&mut self) {
+        unsafe {
+            self.retcode = raw::pcap_next_ex(*self.handle, &mut self.header, &mut self.packet);
+        }
+    }
+
+    fn get_packet(&self) -> Result<Packet, Error> {
+        match self.retcode {
+            i if i >= 1 => {
+                // packet was read without issue
+                unsafe {
+                    Ok(Packet::new(
+                        &*(&*self.header as *const raw::pcap_pkthdr as *const PacketHeader),
+                        slice::from_raw_parts(self.packet, (*self.header).caplen as _),
+                    ))
+                }
+            }
+            0 => {
+                // packets are being read from a live capture and the
+                // timeout expired
+                Err(TimeoutExpired)
+            }
+            -1 => {
+                // -1 => an error occured while reading the packet
+                if let Err(e) = self.check_err(false) {
+                    Err(e)
+                } else {
+                    unreachable!()
+                }
+            }
+            -2 => {
+                // packets are being read from a "savefile" and there are no
+                // more packets to read
+                Err(NoMorePackets)
+            }
+            _ => {
+                // libpcap only defines codes >=1, 0, -1, and -2
+                unreachable!()
+            }
+        }
+    }
+
     /// Blocks until a packet is returned from the capture handle or an error occurs.
     ///
     /// pcap captures packets and places them into a buffer which this function reads
@@ -1047,35 +1095,8 @@ impl<T: Activated + ?Sized> Capture<T> {
     /// you probably want to minimize the time between calls of this next() method.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Packet, Error> {
-        unsafe {
-            let mut header: *mut raw::pcap_pkthdr = ptr::null_mut();
-            let mut packet: *const libc::c_uchar = ptr::null();
-            let retcode = raw::pcap_next_ex(*self.handle, &mut header, &mut packet);
-            self.check_err(retcode != -1)?; // -1 => an error occured while reading the packet
-            match retcode {
-                i if i >= 1 => {
-                    // packet was read without issue
-                    Ok(Packet::new(
-                        &*(&*header as *const raw::pcap_pkthdr as *const PacketHeader),
-                        slice::from_raw_parts(packet, (*header).caplen as _),
-                    ))
-                }
-                0 => {
-                    // packets are being read from a live capture and the
-                    // timeout expired
-                    Err(TimeoutExpired)
-                }
-                -2 => {
-                    // packets are being read from a "savefile" and there are no
-                    // more packets to read
-                    Err(NoMorePackets)
-                }
-                _ => {
-                    // libpcap only defines codes >=1, 0, -1, and -2
-                    unreachable!()
-                }
-            }
-        }
+        self.advance_packet();
+        (*self).get_packet()
     }
 
     #[cfg(feature = "capture-stream")]
