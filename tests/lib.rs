@@ -339,3 +339,15 @@ fn test_compile_optimized() {
 
     assert!(instr_opt.len() < instr_unopt.len());
 }
+
+#[test]
+fn test_new_savefile_in_loop() {
+    fn compile_test(mut capture: Capture<Offline>, output: &Path) -> Result<(), Error> {
+        while let Ok(packet) = capture.next() {
+            let mut savefile = capture.savefile(output)?;
+            savefile.write(&packet);
+            savefile.flush()?;
+        }
+        Ok(())
+    }
+}
